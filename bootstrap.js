@@ -1,0 +1,246 @@
+/* 稿纸格子：文字批注(T) 本身带格子背景，宽度锁 25 格，高度按整行吸附 */
+var GridBox;
+
+const COLS = 25;
+const LINE_H = 1.25;          // 行高 = 字号 * LINE_H，同时写进 CSS
+const GRID_COLOR = '#808080';
+const AUTO_SNAP = true;
+const TAG_TEXT = 'gridbox:text';
+const TAG_ROWS = 'gridbox:rows:';
+
+function install() {}
+function uninstall() {}
+
+async function startup({ id, version }) {
+  await Zotero.initializationPromise;
+  GridBox = {
+    id, busy: false, state: {}, handlers: [], observerID: null, tabObserverID: null, injectTimer: null,
+
+    log(msg) {
+      Zotero.debug('[GridBox] ' + msg);
+    },
+
+    geom(item) {
+      const pos = JSON.parse(item.annotationPosition);
+      const fs = pos.fontSize || 14;
+      const [x1, y1, x2, y2] = pos.rects[0];
+      return { pos, fs, x1, y1, x2, y2, rowH: fs * LINE_H };
+    },
+
+    toFull(str) {
+      return str.replace(/[!-~]/g, c => String.fromCharCode(c.charCodeAt(0) + 0xFEE0)).replace(/ /g, '　');
+    },
+
+    // 行数记在标签里；评论没变而高度变了 = 用户拖拽 -> 更新行数；评论变了 = Zotero 自动缩高 -> 保持行数
+    async snap(item, rowsHint) {
+      if (this.busy) return;
+      this.busy = true;
+      try {
+        const g = this.geom(item);
+        const rowTag = item.getTags().find(t => t.tag.startsWith(TAG_ROWS));
+        const tagRows = rowTag ? parseInt(rowTag.tag.slice(TAG_ROWS.length)) : 0;
+        const comment = this.toFull(item.annotationComment || '');
+        const lines = comment.split(String.fromCharCode(10)).reduce((n, l) => n + Math.max(1, Math.ceil(Array.from(l).length / COLS)), 0);
+        const prev = this.state[item.key];
+        const dragged = rowsHint == null && prev && prev.comment === comment && prev.h !== Math.round((g.y2 - g.y1) * 10);
+        const heightRows = Math.max(1, Math.round((g.y2 - g.y1) / g.rowH));
+        let rows = rowsHint || (dragged || !tagRows ? heightRows : tagRows);
+        rows = Math.max(rows, lines);
+        const rect = [g.x1, g.y2 - rows * g.rowH, g.x1 + COLS * g.fs, g.y2];
+        const pos = JSON.stringify(Object.assign({}, g.pos, { rects: [rect] }));
+        let changed = false;
+        if (pos !== item.annotationPosition) { item.annotationPosition = pos; changed = true; }
+        if (comment !== (item.annotationComment || '')) { item.annotationComment = comment; changed = true; }
+        if (!item.hasTag(TAG_TEXT)) { item.addTag(TAG_TEXT); changed = true; }
+        if (tagRows !== rows) {
+          if (rowTag) item.removeTag(rowTag.tag);
+          item.addTag(TAG_ROWS + rows); changed = true;
+        }
+        this.state[item.key] = { comment, h: Math.round(rows * g.rowH * 10) };
+        if (changed) { await item.saveTx(); this.log('snapped rows=' + rows + ' dragged=' + !!dragged + ' lines=' + lines); }
+      } catch (e) {
+        this.log('ERROR ' + e + ' ' + e.stack);
+      } finally { this.busy = false; }
+    },
+
+    async createGrid(reader, rows) {
+      this.log('createGrid begin');
+      const att = reader._item;
+      let pageIndex = 0, view = [0, 0, 595, 842];
+      try {
+        const app = reader._internalReader._primaryView._iframeWindow.wrappedJSObject.PDFViewerApplication;
+        pageIndex = app.pdfViewer.currentPageNumber - 1;
+        view = Array.from(app.pdfViewer.getPageView(pageIndex).pdfPage.view);
+      } catch (e) {
+        try { pageIndex = reader._internalReader._state.primaryViewStats.pageIndex || 0; } catch (e2) {}
+        this.log('page lookup fallback ' + pageIndex);
+      }
+      this.log('page ' + pageIndex + ' view ' + JSON.stringify(view));
+
+      const fs = 14;
+      const x1 = view[0] + 40, y2 = view[3] - 60;
+      const rect = [x1, y2 - rows * fs * LINE_H, x1 + COLS * fs, y2];
+      const pad = n => String(n).padStart(5, '0');
+      const text = new Zotero.Item('annotation');
+      text.libraryID = att.libraryID;
+      text.parentID = att.id;
+      text.annotationType = 'text';
+      text.annotationColor = '#000000';
+      text.annotationPageLabel = String(pageIndex + 1);
+      text.annotationSortIndex = pad(pageIndex) + '|000000|' + pad(Math.max(0, Math.round(view[3] - y2)));
+      text.annotationPosition = JSON.stringify({ pageIndex, fontSize: fs, rotation: 0, rects: [rect] });
+      text.annotationComment = '';
+      text.addTag(TAG_TEXT);
+      text.addTag(TAG_ROWS + rows);
+      await text.saveTx();
+      this.log('created ' + text.key);
+    },
+
+    // 向阅读器页面注入按钮和格子样式
+    inject(reader) {
+      const doc = reader._iframeWindow && reader._iframeWindow.document;
+      if (doc && doc.body && !doc.getElementById('gridbox-btn')) {
+        const b = doc.createElement('button');
+        b.id = 'gridbox-btn';
+        b.title = '插入稿纸格子 (25列)';
+        b.textContent = '格';
+        b.style.cssText = 'position:fixed;top:48px;right:12px;z-index:99999;width:32px;height:32px;font-size:16px;font-weight:bold;cursor:pointer;';
+        b.addEventListener('click', () => {
+          this.log('button clicked');
+          this.createGrid(reader, 4).catch(e => this.log('ERROR ' + e + ' ' + e.stack));
+        });
+        doc.body.appendChild(b);
+        this.log('button injected');
+      }
+      // 格子样式：只作用于带标签的文字批注
+      try {
+        const views = [reader._internalReader._primaryView, reader._internalReader._secondaryView].filter(Boolean);
+        const keys = this.gridKeys(reader);
+        const rule = k => '.textAnnotation[data-id="' + k.key + '"]{height:calc(' + (k.rows * LINE_H) + 'em) !important;width:25em !important;min-height:0 !important;min-width:0 !important;}';
+        const sel = keys.map(k => '.textAnnotation[data-id="' + k.key + '"]').join(',');
+        const css = keys.length ? sel + '{padding:0 !important;margin:0;line-height:' + LINE_H + ' !important;letter-spacing:0 !important;'
+          + 'caret-color:transparent !important;white-space:pre-wrap !important;overflow-wrap:anywhere !important;word-break:break-all !important;line-break:anywhere;'
+          + 'text-align:left;background-color:transparent;'
+          + 'background-image:linear-gradient(to left,' + GRID_COLOR + ' 1px,transparent 1px),linear-gradient(to top,' + GRID_COLOR + ' 1px,transparent 1px) !important;'
+          + 'background-size:1em ' + LINE_H + 'em !important;box-shadow:inset 1px 0 0 ' + GRID_COLOR + ',inset 0 1px 0 ' + GRID_COLOR + ';}'
+          + keys.map(rule).join('') : '';
+        for (const v of views) {
+          const d = v._iframeWindow.document;
+          let st = d.getElementById('gridbox-style');
+          if (!st) { st = d.createElement('style'); st.id = 'gridbox-style'; d.head.appendChild(st); }
+          if (st.textContent !== css) st.textContent = css;
+          this.hookTextareas(d);
+        }
+      } catch (e) { this.log('style ERROR ' + e); }
+    },
+
+    gridKeys(reader) {
+      return reader._item.getAnnotations().filter(a => a.annotationType === 'text' && a.hasTag(TAG_TEXT)).map(a => {
+        const t = a.getTags().find(t => t.tag.startsWith(TAG_ROWS));
+        return { key: a.key, rows: t ? parseInt(t.tag.slice(TAG_ROWS.length)) : 1 };
+      });
+    },
+
+    updateCursor(ta) {
+      const d = ta.ownerDocument;
+      if (d.activeElement !== ta) return;
+      if (!ta.__gbc) {
+        const c = d.createElement('div');
+        c.style.cssText = 'position:absolute;pointer-events:none;background:rgba(80,140,255,0.45);display:none;';
+        ta.parentNode.insertBefore(c, ta);
+        ta.__gbc = c;
+      }
+      const c = ta.__gbc;
+      const fs = parseFloat(d.defaultView.getComputedStyle(ta).fontSize);
+      const chars = Array.from(ta.value.slice(0, ta.selectionStart));
+      let row = 0, col = 0;
+      for (const ch of chars) {
+        if (ch === String.fromCharCode(10)) { row++; col = 0; continue; }
+        col++;
+        if (col >= COLS) { row++; col = 0; }
+      }
+      c.style.left = (ta.offsetLeft + col * fs) + 'px';
+      c.style.top = (ta.offsetTop + row * fs * LINE_H) + 'px';
+      c.style.width = fs + 'px';
+      c.style.height = (fs * LINE_H) + 'px';
+      c.style.display = 'block';
+    },
+
+    // 对输入框：实时转全角(输入法组合期间跳过)
+    hookTextareas(d) {
+      for (const ta of d.querySelectorAll('.textAnnotation')) {
+        if (ta.__gb) continue;
+        ta.__gb = true;
+        const conv = () => {
+          const v = this.toFull(ta.value);
+          if (v !== ta.value) { const p = ta.selectionStart; ta.value = v; ta.setSelectionRange(p, p); }
+        };
+        ta.addEventListener('input', e => { if (!e.isComposing) conv(); }, true);
+        ta.addEventListener('compositionend', conv, true);
+        const upd = () => this.updateCursor(ta);
+        for (const ev of ['input', 'keyup', 'keydown', 'click', 'focus', 'select', 'compositionupdate', 'compositionend']) ta.addEventListener(ev, () => setTimeout(upd, 0), true);
+        ta.addEventListener('blur', () => { if (ta.__gbc) ta.__gbc.style.display = 'none'; }, true);
+        d.addEventListener('selectionchange', () => { if (d.activeElement === ta) upd(); });
+      }
+    },
+
+    injectAll() {
+      try { for (const r of Zotero.Reader._readers) this.inject(r); } catch (e) { this.log('injectAll ERROR ' + e); }
+    },
+
+    addToUI() {
+      const type = 'createAnnotationContextMenu';
+      const handler = event => {
+        const { reader, params, append } = event;
+        append({
+          label: '转为稿纸格子 (25列)',
+          onCommand: async () => {
+            for (const key of params.ids) {
+              const it = Zotero.Items.getByLibraryAndKey(reader._item.libraryID, key);
+              if (it && it.annotationType === 'text') await GridBox.snap(it, null);
+            }
+            GridBox.injectAll();
+          },
+        });
+      };
+      Zotero.Reader.registerEventListener(type, handler, id);
+      this.handlers.push([type, handler]);
+
+      this.tabObserverID = Zotero.Notifier.registerObserver({
+        notify: () => { setTimeout(() => this.injectAll(), 800); setTimeout(() => this.injectAll(), 2500); },
+      }, ['tab'], 'gridbox-tab');
+      this.injectTimer = setInterval(() => this.injectAll(), 700);
+
+      this.observerID = Zotero.Notifier.registerObserver({
+        notify: async (event, type, ids) => {
+          if (!AUTO_SNAP || event !== 'modify' || this.busy) return;
+          for (const itemID of ids) {
+            const it = Zotero.Items.get(itemID);
+            if (!it || !it.isAnnotation() || it.annotationType !== 'text' || !it.hasTag(TAG_TEXT)) continue;
+            await this.snap(it, null);
+          }
+        },
+      }, ['item'], 'gridbox');
+    },
+
+    removeFromUI() {
+      for (const [type, handler] of this.handlers) Zotero.Reader.unregisterEventListener(type, handler);
+      this.handlers = [];
+      if (this.tabObserverID) Zotero.Notifier.unregisterObserver(this.tabObserverID);
+      if (this.observerID) Zotero.Notifier.unregisterObserver(this.observerID);
+      clearInterval(this.injectTimer);
+      try {
+        for (const r of Zotero.Reader._readers) {
+          const e = r._iframeWindow.document.getElementById('gridbox-btn'); if (e) e.remove();
+          for (const v of [r._internalReader._primaryView, r._internalReader._secondaryView]) {
+            const s = v && v._iframeWindow.document.getElementById('gridbox-style'); if (s) s.remove();
+          }
+        }
+      } catch (e) {}
+    },
+  };
+  GridBox.addToUI();
+  GridBox.log('started ' + version);
+}
+
+function shutdown() { if (GridBox) { GridBox.removeFromUI(); GridBox = undefined; } }
