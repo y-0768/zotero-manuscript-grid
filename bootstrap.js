@@ -31,8 +31,11 @@ async function startup({ id, version }) {
     },
 
     toFull(str) {
-      return str.replace(/[!-~]/g, c => String.fromCharCode(c.charCodeAt(0) + 0xFEE0)).replace(/ /g, '　');
+      return str.replace(/​/g, '').replace(/[!-~]/g, c => String.fromCharCode(c.charCodeAt(0) + 0xFEE0)).replace(/[ ⠀]/g, String.fromCharCode(0x3000));
     },
+
+    // 首尾加零宽字符，防止阅读器 trim() 吞掉行首/行尾的全角空格
+    mark(str) { return str ? String.fromCharCode(0x200B) + str + String.fromCharCode(0x200B) : str; },
 
     // 行数记在标签里；评论没变而高度变了 = 用户拖拽 -> 更新行数；评论变了 = Zotero 自动缩高 -> 保持行数
     async snap(item, rowsHint) {
@@ -53,7 +56,8 @@ async function startup({ id, version }) {
         const pos = JSON.stringify(Object.assign({}, g.pos, { rects: [rect] }));
         let changed = false;
         if (pos !== item.annotationPosition) { item.annotationPosition = pos; changed = true; }
-        if (comment !== (item.annotationComment || '')) { item.annotationComment = comment; changed = true; }
+        const marked = this.mark(comment);
+        if (marked !== (item.annotationComment || '')) { item.annotationComment = marked; changed = true; }
         if (!item.hasTag(TAG_TEXT)) { item.addTag(TAG_TEXT); changed = true; }
         if (tagRows !== rows) {
           if (rowTag) item.removeTag(rowTag.tag);
@@ -221,7 +225,7 @@ async function startup({ id, version }) {
       }
       const c = ta.__gbc;
       const fs = parseFloat(d.defaultView.getComputedStyle(ta).fontSize);
-      const chars = Array.from(ta.value.slice(0, ta.selectionStart));
+      const chars = Array.from(ta.value.slice(0, ta.selectionStart)).filter(c => c !== String.fromCharCode(0x200B));
       let row = 0, col = 0;
       for (const ch of chars) {
         if (ch === String.fromCharCode(10)) { row++; col = 0; continue; }
@@ -241,8 +245,15 @@ async function startup({ id, version }) {
         if (ta.__gb) continue;
         ta.__gb = true;
         const conv = () => {
-          const v = this.toFull(ta.value);
-          if (v !== ta.value) { const p = ta.selectionStart; ta.value = v; ta.setSelectionRange(p, p); }
+          const v = this.mark(this.toFull(ta.value));
+          if (v !== ta.value) {
+            const n = Array.from(ta.value.slice(0, ta.selectionStart)).filter(c => c !== String.fromCharCode(0x200B)).length;
+            ta.value = v;
+            let p = 0, seen = 0;
+            while (p < v.length && seen < n) { if (v[p] !== String.fromCharCode(0x200B)) seen++; p++; }
+            if (p === 0 && v.length) p = 1;
+            ta.setSelectionRange(p, p);
+          }
         };
         ta.addEventListener('input', e => { if (!e.isComposing) conv(); }, true);
         const live = () => {
@@ -251,6 +262,16 @@ async function startup({ id, version }) {
           if (lines > (this.rowsLive[key] || 0)) { this.rowsLive[key] = lines; this.injectAll(); }
         };
         ta.addEventListener('input', live, true);
+        // Tab = 空两格（两个全角空格），并阻止焦点跳走
+        ta.addEventListener('keydown', e => {
+          if (e.key !== 'Tab' || e.isComposing || e.ctrlKey || e.altKey || e.metaKey) return;
+          e.preventDefault(); e.stopPropagation();
+          const sp = String.fromCharCode(0x3000).repeat(2);
+          const a = ta.selectionStart, b = ta.selectionEnd;
+          ta.value = ta.value.slice(0, a) + sp + ta.value.slice(b);
+          ta.setSelectionRange(a + 2, a + 2);
+          ta.dispatchEvent(new d.defaultView.Event('input', { bubbles: true }));
+        }, true);
         ta.addEventListener('compositionend', conv, true);
         const upd = () => this.updateCursor(ta);
         try { new d.defaultView.ResizeObserver(() => upd()).observe(ta); } catch (e) {}
