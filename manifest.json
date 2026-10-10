@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Manuscript Grid (稿纸格子)",
-  "version": "1.0.0",
+  "version": "1.0.8",
   "author": "y-0768",
   "description": "Insert Chinese manuscript-paper style grid text boxes (25 columns, snapping rows) into Zotero PDF reader / 在 Zotero PDF 中插入25列稿纸格子文本框",
   "applications": {

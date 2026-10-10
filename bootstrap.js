@@ -14,7 +14,7 @@ function uninstall() {}
 async function startup({ id, version }) {
   await Zotero.initializationPromise;
   GridBox = {
-    id, busy: false, state: {}, handlers: [], observerID: null, tabObserverID: null, injectTimer: null,
+    id, busy: false, state: {}, rowsLive: {}, handlers: [], observerID: null, tabObserverID: null, injectTimer: null,
 
     log(msg) {
       Zotero.debug('[GridBox] ' + msg);
@@ -57,7 +57,7 @@ async function startup({ id, version }) {
           item.addTag(TAG_ROWS + rows); changed = true;
         }
         this.state[item.key] = { comment, h: Math.round(rows * g.rowH * 10) };
-        if (changed) { await item.saveTx(); this.log('snapped rows=' + rows + ' dragged=' + !!dragged + ' lines=' + lines); }
+        if (changed) { await item.saveTx(); delete this.rowsLive[item.key]; this.injectAll(); this.log('snapped rows=' + rows + ' dragged=' + !!dragged + ' lines=' + lines); }
       } catch (e) {
         this.log('ERROR ' + e + ' ' + e.stack);
       } finally { this.busy = false; }
@@ -66,19 +66,26 @@ async function startup({ id, version }) {
     async createGrid(reader, rows) {
       this.log('createGrid begin');
       const att = reader._item;
-      let pageIndex = 0, view = [0, 0, 595, 842];
+      let pageIndex = 0, view = [0, 0, 595, 842], x1 = 40, y2 = view[3] - 60;
       try {
-        const app = reader._internalReader._primaryView._iframeWindow.wrappedJSObject.PDFViewerApplication;
-        pageIndex = app.pdfViewer.currentPageNumber - 1;
-        view = Array.from(app.pdfViewer.getPageView(pageIndex).pdfPage.view);
+        const win = reader._internalReader._primaryView._iframeWindow;
+        const app = win.PDFViewerApplication || (win.wrappedJSObject && win.wrappedJSObject.PDFViewerApplication);
+        const pv = app.pdfViewer;
+        pageIndex = pv.currentPageNumber - 1;
+        const pageView = pv.getPageView(pageIndex);
+        view = Array.from(pageView.pdfPage.view);
+        // 当前屏幕可见区域的左上角 -> PDF 坐标
+        const cont = win.document.getElementById('viewerContainer');
+        const top = Math.max(0, cont.getBoundingClientRect().top - pageView.div.getBoundingClientRect().top);
+        const [px, py] = pageView.viewport.convertToPdfPoint(40, top + 30);
+        x1 = Math.min(Math.max(view[0] + 10, px), view[2] - COLS * 14 - 10);
+        y2 = Math.min(py, view[3] - 10);
+        this.log('page ' + pageIndex + ' scrollTop ' + top + ' pos ' + x1 + ',' + y2);
       } catch (e) {
-        try { pageIndex = reader._internalReader._state.primaryViewStats.pageIndex || 0; } catch (e2) {}
-        this.log('page lookup fallback ' + pageIndex);
+        this.log('page lookup failed ' + e);
+        y2 = view[3] - 60;
       }
-      this.log('page ' + pageIndex + ' view ' + JSON.stringify(view));
-
       const fs = 14;
-      const x1 = view[0] + 40, y2 = view[3] - 60;
       const rect = [x1, y2 - rows * fs * LINE_H, x1 + COLS * fs, y2];
       const pad = n => String(n).padStart(5, '0');
       const text = new Zotero.Item('annotation');
@@ -99,30 +106,44 @@ async function startup({ id, version }) {
     // 向阅读器页面注入按钮和格子样式
     inject(reader) {
       const doc = reader._iframeWindow && reader._iframeWindow.document;
-      if (doc && doc.body && !doc.getElementById('gridbox-btn')) {
+      const anchor = doc && doc.querySelector('button.toolbar-button.text');
+      if (anchor && !doc.getElementById('gridbox-btn')) {
         const b = doc.createElement('button');
         b.id = 'gridbox-btn';
+        b.tabIndex = -1;
+        b.className = 'toolbar-button';
         b.title = '插入稿纸格子 (25列)';
-        b.textContent = '格';
-        b.style.cssText = 'position:fixed;top:48px;right:12px;z-index:99999;width:32px;height:32px;font-size:16px;font-weight:bold;cursor:pointer;';
+        const NS = 'http://www.w3.org/2000/svg';
+        const svg = doc.createElementNS(NS, 'svg');
+        svg.setAttribute('width', '16');
+        svg.setAttribute('height', '16');
+        svg.setAttribute('viewBox', '0 0 16 16');
+        const p = doc.createElementNS(NS, 'path');
+        p.setAttribute('d', 'M2 2h12v12H2z M2 6h12 M2 10h12 M6 2v12 M10 2v12');
+        p.setAttribute('fill', 'none');
+        p.setAttribute('stroke', 'currentColor');
+        p.setAttribute('stroke-width', '1.2');
+        svg.appendChild(p);
+        b.appendChild(svg);
         b.addEventListener('click', () => {
           this.log('button clicked');
           this.createGrid(reader, 4).catch(e => this.log('ERROR ' + e + ' ' + e.stack));
         });
-        doc.body.appendChild(b);
+        anchor.insertAdjacentElement('afterend', b);
         this.log('button injected');
       }
       // 格子样式：只作用于带标签的文字批注
       try {
         const views = [reader._internalReader._primaryView, reader._internalReader._secondaryView].filter(Boolean);
         const keys = this.gridKeys(reader);
-        const rule = k => '.textAnnotation[data-id="' + k.key + '"]{height:calc(' + (k.rows * LINE_H) + 'em) !important;width:25em !important;min-height:0 !important;min-width:0 !important;}';
+        const hl = (n) => { const L = []; for (let r = 1; r <= n; r++) L.push('linear-gradient(' + GRID_COLOR + ',' + GRID_COLOR + ') 0 calc(' + (r * LINE_H) + 'em - 1px) / 100% 1px no-repeat'); return L; };
+        const bg = k => ['linear-gradient(to left,' + GRID_COLOR + ' 1px,transparent 1px) 0 0 / 1em 100% repeat-x'].concat(hl(k.rows)).join(',');
+        const rule = k => '.textAnnotation[data-id="' + k.key + '"]{background:' + bg(k) + ' !important;height:calc(' + (k.rows * LINE_H) + 'em) !important;width:25em !important;min-height:0 !important;min-width:0 !important;}';
         const sel = keys.map(k => '.textAnnotation[data-id="' + k.key + '"]').join(',');
         const css = keys.length ? sel + '{padding:0 !important;margin:0;line-height:' + LINE_H + ' !important;letter-spacing:0 !important;'
           + 'caret-color:transparent !important;white-space:pre-wrap !important;overflow-wrap:anywhere !important;word-break:break-all !important;line-break:anywhere;'
           + 'text-align:left;background-color:transparent;'
-          + 'background-image:linear-gradient(to left,' + GRID_COLOR + ' 1px,transparent 1px),linear-gradient(to top,' + GRID_COLOR + ' 1px,transparent 1px) !important;'
-          + 'background-size:1em ' + LINE_H + 'em !important;box-shadow:inset 1px 0 0 ' + GRID_COLOR + ',inset 0 1px 0 ' + GRID_COLOR + ';}'
+          + 'box-shadow:inset 1px 0 0 ' + GRID_COLOR + ',inset 0 1px 0 ' + GRID_COLOR + ';}'
           + keys.map(rule).join('') : '';
         for (const v of views) {
           const d = v._iframeWindow.document;
@@ -137,7 +158,8 @@ async function startup({ id, version }) {
     gridKeys(reader) {
       return reader._item.getAnnotations().filter(a => a.annotationType === 'text' && a.hasTag(TAG_TEXT)).map(a => {
         const t = a.getTags().find(t => t.tag.startsWith(TAG_ROWS));
-        return { key: a.key, rows: t ? parseInt(t.tag.slice(TAG_ROWS.length)) : 1 };
+        const rows = t ? parseInt(t.tag.slice(TAG_ROWS.length)) : 1;
+        return { key: a.key, rows: Math.max(rows, this.rowsLive[a.key] || 0) };
       });
     },
 
@@ -176,6 +198,12 @@ async function startup({ id, version }) {
           if (v !== ta.value) { const p = ta.selectionStart; ta.value = v; ta.setSelectionRange(p, p); }
         };
         ta.addEventListener('input', e => { if (!e.isComposing) conv(); }, true);
+        const live = () => {
+          const key = ta.getAttribute('data-id');
+          const lines = this.toFull(ta.value).split(String.fromCharCode(10)).reduce((n, l) => n + Math.max(1, Math.ceil(Array.from(l).length / COLS)), 0);
+          if (lines > (this.rowsLive[key] || 0)) { this.rowsLive[key] = lines; this.injectAll(); }
+        };
+        ta.addEventListener('input', live, true);
         ta.addEventListener('compositionend', conv, true);
         const upd = () => this.updateCursor(ta);
         for (const ev of ['input', 'keyup', 'keydown', 'click', 'focus', 'select', 'compositionupdate', 'compositionend']) ta.addEventListener(ev, () => setTimeout(upd, 0), true);
@@ -209,7 +237,7 @@ async function startup({ id, version }) {
       this.tabObserverID = Zotero.Notifier.registerObserver({
         notify: () => { setTimeout(() => this.injectAll(), 800); setTimeout(() => this.injectAll(), 2500); },
       }, ['tab'], 'gridbox-tab');
-      this.injectTimer = setInterval(() => this.injectAll(), 700);
+      this.injectTimer = setInterval(() => this.injectAll(), 1500);
 
       this.observerID = Zotero.Notifier.registerObserver({
         notify: async (event, type, ids) => {
