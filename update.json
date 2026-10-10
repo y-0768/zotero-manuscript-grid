@@ -3,8 +3,8 @@
     "manuscript-grid@y-0768.github.io": {
       "updates": [
         {
-          "version": "1.1.2",
-          "update_link": "https://github.com/y-0768/zotero-manuscript-grid/releases/download/v1.1.2/manuscript-grid.xpi",
+          "version": "1.2.3",
+          "update_link": "https://github.com/y-0768/zotero-manuscript-grid/releases/download/v1.2.3/manuscript-grid.xpi",
           "applications": {
             "zotero": {
               "strict_min_version": "6.999"
