@@ -5,6 +5,9 @@ const COLS = 25;
 const LINE_H = 1.25;          // 行高 = 字号 * LINE_H，同时写进 CSS
 const GRID_COLOR = '#808080';
 const AUTO_SNAP = true;
+const SIZES = [14, 12, 10, 8, 6];   // 字号档位（大 -> 最小）
+const SIZE_NAMES = ['大 100%', '中大 86%', '中 71%', '小 57%', '最小 43%'];
+const PREF_SIZE = 'extensions.manuscript-grid.fontSize';
 const TAG_TEXT = 'gridbox:text';
 const TAG_ROWS = 'gridbox:rows:';
 
@@ -63,9 +66,43 @@ async function startup({ id, version }) {
       } finally { this.busy = false; }
     },
 
+    // 等比缩放：改字号，左上角不动，行数不变
+    async setSize(item, fs) {
+      if (this.busy) return;
+      this.busy = true;
+      try {
+        const g = this.geom(item);
+        const t = item.getTags().find(t => t.tag.startsWith(TAG_ROWS));
+        const rows = t ? parseInt(t.tag.slice(TAG_ROWS.length)) : Math.max(1, Math.round((g.y2 - g.y1) / g.rowH));
+        const rect = [g.x1, g.y2 - rows * fs * LINE_H, g.x1 + COLS * fs, g.y2];
+        item.annotationPosition = JSON.stringify(Object.assign({}, g.pos, { fontSize: fs, rects: [rect] }));
+        if (!item.hasTag(TAG_TEXT)) item.addTag(TAG_TEXT);
+        await item.saveTx();
+        Zotero.Prefs.set(PREF_SIZE, fs, true);
+        delete this.rowsLive[item.key];
+        this.state[item.key] = { comment: this.toFull(item.annotationComment || ''), h: Math.round(rows * fs * LINE_H * 10) };
+        this.injectAll();
+      } catch (e) { this.log('setSize ERROR ' + e); } finally { this.busy = false; }
+    },
+
+    // 步进：dir=+1 放大，-1 缩小；作用于当前选中的格子批注
+    async stepSelected(reader, dir) {
+      const ids = (reader._internalReader._state.selectedAnnotationIDs) || [];
+      for (const key of ids) {
+        const it = Zotero.Items.getByLibraryAndKey(reader._item.libraryID, key);
+        if (!it || it.annotationType !== 'text') continue;
+        const cur = this.geom(it).fs;
+        let i = SIZES.reduce((b, v, j) => Math.abs(v - cur) < Math.abs(SIZES[b] - cur) ? j : b, 0);
+        i = Math.min(SIZES.length - 1, Math.max(0, i - dir));
+        await this.setSize(it, SIZES[i]);
+      }
+    },
+
     async createGrid(reader, rows) {
       this.log('createGrid begin');
       const att = reader._item;
+      const saved = Zotero.Prefs.get(PREF_SIZE, true);
+      const fs = SIZES.includes(saved) ? saved : SIZES[0];
       let pageIndex = 0, view = [0, 0, 595, 842], x1 = 40, y2 = view[3] - 60;
       try {
         const win = reader._internalReader._primaryView._iframeWindow;
@@ -78,14 +115,13 @@ async function startup({ id, version }) {
         const cont = win.document.getElementById('viewerContainer');
         const top = Math.max(0, cont.getBoundingClientRect().top - pageView.div.getBoundingClientRect().top);
         const [px, py] = pageView.viewport.convertToPdfPoint(40, top + 30);
-        x1 = Math.min(Math.max(view[0] + 10, px), view[2] - COLS * 14 - 10);
+        x1 = Math.min(Math.max(view[0] + 10, px), view[2] - COLS * fs - 10);
         y2 = Math.min(py, view[3] - 10);
         this.log('page ' + pageIndex + ' scrollTop ' + top + ' pos ' + x1 + ',' + y2);
       } catch (e) {
         this.log('page lookup failed ' + e);
         y2 = view[3] - 60;
       }
-      const fs = 14;
       const rect = [x1, y2 - rows * fs * LINE_H, x1 + COLS * fs, y2];
       const pad = n => String(n).padStart(5, '0');
       const text = new Zotero.Item('annotation');
@@ -129,7 +165,17 @@ async function startup({ id, version }) {
           this.log('button clicked');
           this.createGrid(reader, 4).catch(e => this.log('ERROR ' + e + ' ' + e.stack));
         });
+        const mk = (id, label, title, dir) => {
+          const x = doc.createElement('button');
+          x.id = id; x.tabIndex = -1; x.className = 'toolbar-button'; x.title = title;
+          x.textContent = label; x.style.cssText = 'font-size:12px;font-weight:bold;';
+          x.addEventListener('click', () => this.stepSelected(reader, dir).catch(e => this.log('ERROR ' + e)));
+          return x;
+        };
+        const up = mk('gridbox-up', 'A+', '放大选中的格子', +1), down = mk('gridbox-down', 'A-', '缩小选中的格子', -1);
         anchor.insertAdjacentElement('afterend', b);
+        b.insertAdjacentElement('afterend', up);
+        up.insertAdjacentElement('afterend', down);
         this.log('button injected');
       }
       // 格子样式：只作用于带标签的文字批注
@@ -138,9 +184,9 @@ async function startup({ id, version }) {
         const keys = this.gridKeys(reader);
         const hl = (n) => { const L = []; for (let r = 1; r <= n; r++) L.push('linear-gradient(' + GRID_COLOR + ',' + GRID_COLOR + ') 0 calc(' + (r * LINE_H) + 'em - 1px) / 100% 1px no-repeat'); return L; };
         const bg = k => ['linear-gradient(to left,' + GRID_COLOR + ' 1px,transparent 1px) 0 0 / 1em 100% repeat-x'].concat(hl(k.rows)).join(',');
-        const rule = k => '.textAnnotation[data-id="' + k.key + '"]{background:' + bg(k) + ' !important;height:calc(' + (k.rows * LINE_H) + 'em) !important;width:25em !important;min-height:0 !important;min-width:0 !important;}';
+        const rule = k => '.textAnnotation[data-id="' + k.key + '"]{background:' + bg(k) + ' !important;height:calc(' + (k.rows * LINE_H) + 'em) !important;width:25.05em !important;min-height:0 !important;min-width:0 !important;}';
         const sel = keys.map(k => '.textAnnotation[data-id="' + k.key + '"]').join(',');
-        const css = keys.length ? sel + '{padding:0 !important;margin:0;line-height:' + LINE_H + ' !important;letter-spacing:0 !important;'
+        const css = keys.length ? sel + '{padding:0 !important;margin:0;text-rendering:geometricPrecision !important;font-kerning:none;font-variant-ligatures:none;line-height:' + LINE_H + ' !important;letter-spacing:0 !important;'
           + 'caret-color:transparent !important;white-space:pre-wrap !important;overflow-wrap:anywhere !important;word-break:break-all !important;line-break:anywhere;'
           + 'text-align:left;background-color:transparent;'
           + 'box-shadow:inset 1px 0 0 ' + GRID_COLOR + ',inset 0 1px 0 ' + GRID_COLOR + ';}'
@@ -151,6 +197,7 @@ async function startup({ id, version }) {
           if (!st) { st = d.createElement('style'); st.id = 'gridbox-style'; d.head.appendChild(st); }
           if (st.textContent !== css) st.textContent = css;
           this.hookTextareas(d);
+          const act = d.activeElement; if (act && act.classList && act.classList.contains('textAnnotation')) this.updateCursor(act);
         }
       } catch (e) { this.log('style ERROR ' + e); }
     },
@@ -206,6 +253,7 @@ async function startup({ id, version }) {
         ta.addEventListener('input', live, true);
         ta.addEventListener('compositionend', conv, true);
         const upd = () => this.updateCursor(ta);
+        try { new d.defaultView.ResizeObserver(() => upd()).observe(ta); } catch (e) {}
         for (const ev of ['input', 'keyup', 'keydown', 'click', 'focus', 'select', 'compositionupdate', 'compositionend']) ta.addEventListener(ev, () => setTimeout(upd, 0), true);
         ta.addEventListener('blur', () => { if (ta.__gbc) ta.__gbc.style.display = 'none'; }, true);
         d.addEventListener('selectionchange', () => { if (d.activeElement === ta) upd(); });
@@ -220,6 +268,15 @@ async function startup({ id, version }) {
       const type = 'createAnnotationContextMenu';
       const handler = event => {
         const { reader, params, append } = event;
+        SIZES.forEach((fs, i) => append({
+          label: '格子大小：' + SIZE_NAMES[i],
+          onCommand: async () => {
+            for (const key of params.ids) {
+              const it = Zotero.Items.getByLibraryAndKey(reader._item.libraryID, key);
+              if (it && it.annotationType === 'text') await GridBox.setSize(it, fs);
+            }
+          },
+        }));
         append({
           label: '转为稿纸格子 (25列)',
           onCommand: async () => {
@@ -259,7 +316,7 @@ async function startup({ id, version }) {
       clearInterval(this.injectTimer);
       try {
         for (const r of Zotero.Reader._readers) {
-          const e = r._iframeWindow.document.getElementById('gridbox-btn'); if (e) e.remove();
+          for (const n of ['gridbox-btn', 'gridbox-up', 'gridbox-down']) { const e = r._iframeWindow.document.getElementById(n); if (e) e.remove(); }
           for (const v of [r._internalReader._primaryView, r._internalReader._secondaryView]) {
             const s = v && v._iframeWindow.document.getElementById('gridbox-style'); if (s) s.remove();
           }
