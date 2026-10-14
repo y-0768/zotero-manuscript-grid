@@ -253,6 +253,7 @@ async function startup({ id, version }) {
             while (p < v.length && seen < n) { if (v[p] !== String.fromCharCode(0x200B)) seen++; p++; }
             if (p === 0 && v.length) p = 1;
             ta.setSelectionRange(p, p);
+            ta.dispatchEvent(new d.defaultView.InputEvent('input', { bubbles: true, inputType: 'insertText' }));
           }
         };
         ta.addEventListener('input', e => { if (!e.isComposing) conv(); }, true);
@@ -272,7 +273,7 @@ async function startup({ id, version }) {
           ta.setSelectionRange(a + 2, a + 2);
           ta.dispatchEvent(new d.defaultView.Event('input', { bubbles: true }));
         }, true);
-        ta.addEventListener('compositionend', conv, true);
+        // compositionend 不触发 conv，改为全靠 input(isComposing=false) 兜底
         const upd = () => this.updateCursor(ta);
         try { new d.defaultView.ResizeObserver(() => upd()).observe(ta); } catch (e) {}
         for (const ev of ['input', 'keyup', 'keydown', 'click', 'focus', 'select', 'compositionupdate', 'compositionend']) ta.addEventListener(ev, () => setTimeout(upd, 0), true);
